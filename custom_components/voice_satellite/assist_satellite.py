@@ -24,6 +24,7 @@ from homeassistant.components.assist_satellite import (
     AssistSatelliteEntityFeature,
 )
 from homeassistant.components.assist_pipeline import PipelineStage
+from pyspeex_noise import AudioProcessor
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
@@ -1353,11 +1354,56 @@ class VoiceSatelliteEntity(AssistSatelliteEntity):
         }
 
         async def audio_stream():
+            if start_stage == "stt":
+                # HA's local VAD (pymicro_vad) has a fixed 740ms warm-up
+                # (74 x 10ms chunks) before it can score any audio. Short
+                # commands spoken immediately after wake often finish before
+                # that warm-up completes, so stt-vad-start never fires and
+                # the interaction times out at 15s even though STT still
+                # recognizes the word later. Priming with ~800ms of silence
+                # burns the warm-up before real audio arrives.
+                silence_chunk = b"\x00" * 320  # 10ms @ 16kHz/16-bit mono
+                for _ in range(80):  # 800ms
+                    yield silence_chunk
+
+            # Auto-gain + noise suppression before HA's VAD scores each
+            # chunk. HA core has this same capability (pyspeex_noise,
+            # driven by prefers_auto_gain_enabled/prefers_noise_reduction_
+            # enabled on the STT engine) but assist_satellite/entity.py
+            # never wires it up for satellite pipelines - so we run it
+            # ourselves here instead. Verified against real failing
+            # recordings: flips ~60% of marginal/weak "stop" utterances
+            # from never-detected to cleanly detected, no regressions on
+            # ones that already worked.
+            #
+            # Process10ms requires an exact 320-byte (10ms) frame, but
+            # incoming websocket binary frames from the client are NOT
+            # guaranteed to be that size (the client may batch multiple
+            # 10ms frames per network message). HA core's own pipeline
+            # re-chunks for exactly this reason (assist_pipeline.vad.
+            # chunk_samples, used in process_enhance_audio) - we need the
+            # same re-chunking here since we're upstream of that safety
+            # net. Skipping this caused audibly choppy/garbled audio.
+            #
+            # NOTE: pymicro_vad/pyspeex_noise's actual installed API
+            # differs from what recent PyPI releases document (method
+            # casing, positional-vs-keyword args, return types). The calls
+            # below match what HA core itself pins and actually runs:
+            # pymicro-vad==1.0.1, pyspeex-noise==1.0.2 (Process10ms, not
+            # process_10ms; positional args only; returns an object with
+            # a .audio attribute, not raw bytes).
+            audio_processor = AudioProcessor(4000, -30)  # auto_gain, noise_suppression
+            leftover = b""
+
             while True:
                 chunk = await audio_queue.get()
                 if not chunk:  # empty bytes = stop signal
                     break
-                yield chunk
+                leftover += chunk
+                while len(leftover) >= 320:
+                    frame = leftover[:320]
+                    leftover = leftover[320:]
+                    yield audio_processor.Process10ms(frame).audio
 
         _LOGGER.debug(
             "Bridged pipeline starting for '%s' (start=%s, end=%s)",
